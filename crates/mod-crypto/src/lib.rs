@@ -1,127 +1,179 @@
-use config::get_or_create_sub_module;
+
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use std::fs;
 use mlua::{Error as LuaError}; 
+use config::get_or_create_sub_module;
 use mlua::Lua;
-use data_loader::KeySource;
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
 
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Nonce, Key,
-};
-use std::fs::File;
-use std::io::{Read};
-// Import the base64 crate Engine trait anonymously so we can
-// call its methods without adding to the namespace.
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-
-// TODO 
-// use https://github.com/KumoCorp/kumomta/blob/main/crates/data-loader/src/lib.rs#L13 KeySource
-// add unit-tests
-pub struct AesParam {
-pub aes_key_source: Option<KeySource>,
+#[derive(Clone, Debug)]
+pub struct AesParams {
+    pub key: AesKey,
+    pub iv: [u8; 16],
 }
 
 
-
-
-/// aes_encrypt
-/// 1) TODO: use the Keystore input instead of enc_key
-/// 2) TODO: depending on the key bits use the correct Chiper creation
-pub fn aes_encrypt(value: String, enc_key: String, key_length_bits: usize) -> Result< String, aes_gcm::Error> {
-    // Determine expected key size in bytes
-    let key_size_bytes = match key_length_bits {
-        128 => 16,
-        192 => 24,
-        256 => 32,
-        _ => panic!("Unsupported key size: {key_length_bits} bits"),
-    };
-
-    // Read the key from the file
-    let mut file = File::open(enc_key).map_err(|_| aes_gcm::Error)?;
-    let mut key_bytes = vec![0u8; key_size_bytes];
-    file.read_exact(&mut key_bytes).map_err(|_| aes_gcm::Error)?;
-
-    // 
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    // Generate a random 96-bit nonce
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12 bytes
-
-    // Encrypt the value
-    let ciphertext = cipher.encrypt(&nonce, value.as_bytes())?;
-    
-  // Prepend nonce to ciphertext (optional, but required for decryption later)
-    let mut nonce_and_ciphertext = nonce.to_vec();
-    nonce_and_ciphertext.extend_from_slice(&ciphertext);
-
-
-    // Encode the combined result to base64
-    let encoded = STANDARD.encode(nonce_and_ciphertext);
-
-    println!("Encryption OK!");
-    Ok(encoded)
+#[derive(Clone, Debug)]
+pub enum AesKey {
+    Aes128([u8; 16]),
+    Aes256([u8; 32]),
 }
 
-pub fn aes_decrypt(encoded: String, enc_key: String, key_length_bits: usize) -> Result<String, aes_gcm::Error> {
-    // Determine expected key size in bytes
-    let key_size_bytes = match key_length_bits {
-        128 => 16,
-        192 => 24,
-        256 => 32,
-        _ => panic!("Unsupported key size: {key_length_bits} bits"),
-    };
-
-    // Read key from file
-    let mut file = File::open(enc_key).map_err(|_| aes_gcm::Error)?;
-    let mut key_bytes = vec![0u8; key_size_bytes];
-    file.read_exact(&mut key_bytes).map_err(|_| aes_gcm::Error)?;
-
-    // Create cipher
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    // Decode base64 input
-    let nonce_and_ciphertext = STANDARD.decode(encoded).map_err(|_| aes_gcm::Error)?;
-
-    // Split nonce and ciphertext
-    if nonce_and_ciphertext.len() < 12 {
-        return Err(aes_gcm::Error); // Too short to contain valid nonce + data
+impl AesKey {
+    // Associated function to create AesKey from raw bytes 
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+        match bytes.len() {
+            16 => {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(bytes);
+                Ok(AesKey::Aes128(arr))
+            }
+            32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                Ok(AesKey::Aes256(arr))
+            }
+            _ => Err("Key length must be 16 or 32 bytes"),
+        }
     }
-    let (nonce_bytes, ciphertext) = nonce_and_ciphertext.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    // Decrypt
-    let plaintext_bytes = cipher.decrypt(nonce, ciphertext.as_ref())?;
-    let plaintext = String::from_utf8(plaintext_bytes).map_err(|_| aes_gcm::Error)?;
-
-    println!("Decryption OK!");
-    Ok(plaintext)
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = fs::read(path)?;
+        AesKey::from_bytes(&bytes).map_err(|e| e.into())
+    }
 }
 
+fn aes_encrypt_cbc(plaintext: &str,  params: AesParams)->  Result<Vec<u8>, &'static str> {
+    let plaintext_bytes = plaintext.as_bytes();
+    // Buffer must be big enough for padded plaintext.
+    // For PKCS7 padding, max size = plaintext length + block size
+    let block_size = 16;
+    let mut buf = vec![0u8; plaintext.len() + block_size];
 
+    // Copy plaintext to buffer
+    buf[..plaintext.len()].copy_from_slice(plaintext_bytes);
 
+    // handle 128 and 256 keys with the given IV
+    match params.key {
+        AesKey::Aes128(k) => {
+        let cipher = Aes128CbcEnc::new((&k).into(), (&params.iv).into());
+           match cipher.encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext_bytes.len()) {
+           Ok(ct) => Ok(ct.to_vec()),
+           Err(_) => Err("Encryption failed or padding error"),
+         }
+        
+        }
+        AesKey::Aes256(k) => {
+        let cipher = Aes256CbcEnc::new((&k).into(), (&params.iv).into());
+           match cipher.encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext_bytes.len()) {
+           Ok(ct) => Ok(ct.to_vec()),
+           Err(_) => Err("Encryption failed or padding error"),
+        }
+    }
+   }
+}
 
-// Todo remove enc_key argument.
+fn aes_decrypt_cbc(ciphertext: &[u8], params: AesParams) -> Result<Vec<u8>, &'static str> {
+    let mut buf = ciphertext.to_vec();
+
+    match params.key {
+        AesKey::Aes128(k) => {
+            let cipher = Aes128CbcDec::new((&k).into(), (&params.iv).into());
+            cipher.decrypt_padded_mut::<Pkcs7>(&mut buf)
+                .map(|pt| pt.to_vec())
+                .map_err(|_| "Decryption failed for AES-128")
+        }
+        AesKey::Aes256(k) => {
+            let cipher = Aes256CbcDec::new((&k).into(), (&params.iv).into());
+            cipher.decrypt_padded_mut::<Pkcs7>(&mut buf)
+                .map(|pt| pt.to_vec())
+                .map_err(|_| "Decryption failed for AES-256")
+        }
+    }
+}
+
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let crypto = get_or_create_sub_module(lua, "crypto")?;
        crypto.set(
-            "aes_encrypt",
-            lua.create_function(|_, (value, enc_key, key_length_bits): (String, String, usize)| {
-                  let result = aes_encrypt(value, enc_key, key_length_bits)
+            "aes_encrypt_cbc",
+            lua.create_function(|_, (value, enc_key,  iv_param): (String, String,  [u8; 16])| {
+            // TODO: aes_key should come either from bytes or from file depending of user. Use keysource later
+            // TODO: if len is not 16 bytes just erorr our friendly
+               let aes_key = AesKey::from_bytes(enc_key.as_bytes())
+                               .map_err(|e| LuaError::external(e.to_string()))?;
+                 let  p = AesParams { key: aes_key, iv: iv_param};
+                 let result = aes_encrypt_cbc(&value, p)
                      .map_err(|e| LuaError::external(e.to_string()))?;
              Ok(result)
              })?,
     )?;
        crypto.set(
-        "aes_decrypt",
-        lua.create_function(|_, (value, enc_key ,  key_length_bits): (String, String, usize)| {
-                let result= aes_decrypt(value, enc_key, key_length_bits)
-                .map_err(|e| LuaError::external(e.to_string()))?;
+        "aes_decrypt_cbc",
+        lua.create_function(|_, (value, enc_key,  iv_param): (String, String,  [u8; 16])| {
+            // TODO: aes_key should come either from bytes or from file depending of user. Use keysource later
+            // TODO: if len is not 16 bytes just erorr our friendly
+               let aes_key = AesKey::from_bytes(enc_key.as_bytes())
+                               .map_err(|e| LuaError::external(e.to_string()))?;
+                 let  p = AesParams { key: aes_key, iv: iv_param};
+                 let result = aes_decrypt_cbc(&value.as_bytes(), p)
+                     .map_err(|e| LuaError::external(e.to_string()))?;
              Ok(result)
-        })?,
+             })?,
     )?;
-
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encrypt_decrypt_aes128() {
+        let key = AesKey::Aes128([0x11; 16]);
+        let iv = [0x22; 16];
+        let params = AesParams { key: key.clone(), iv };
+
+        let plaintext = "This is a test message for AES-128";
+        let ciphertext = aes_encrypt_cbc(plaintext, params.clone())
+            .expect("Encryption failed");
+        let decrypted = aes_decrypt_cbc(&ciphertext, params)
+            .expect("Decryption failed");
+
+        assert_eq!(decrypted, plaintext.as_bytes());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_aes256() {
+        let key = AesKey::Aes256([0x33; 32]);
+        let iv = [0x44; 16];
+        let params = AesParams { key: key.clone(), iv };
+
+        let plaintext = "This is a test message for AES-256 encryption";
+        let ciphertext = aes_encrypt_cbc(plaintext, params.clone())
+            .expect("Encryption failed");
+        let decrypted = aes_decrypt_cbc(&ciphertext, params)
+            .expect("Decryption failed");
+
+        assert_eq!(decrypted, plaintext.as_bytes());
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_key_fails() {
+        let correct_key = AesKey::Aes128([0x11; 16]);
+        let wrong_key = AesKey::Aes128([0x22; 16]);
+        let iv = [0x22; 16];
+        let correct_params = AesParams { key: correct_key.clone(), iv };
+        let wrong_params = AesParams { key: wrong_key, iv };
+
+        let plaintext = "This message won't decrypt correctly with the wrong key";
+        let ciphertext = aes_encrypt_cbc(plaintext, correct_params.clone())
+            .expect("Encryption failed");
+
+        let result = aes_decrypt_cbc(&ciphertext, wrong_params);
+        assert!(result.is_err());
+    }
 }
