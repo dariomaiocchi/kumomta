@@ -27,6 +27,15 @@ pub struct LuaCfg {
     pub iv: [u8; 16],
 }
 
+#[derive(Deserialize,Clone, Debug)]
+pub struct LuaCfgDecrypt {
+    pub key_lua: Option<KeySource>, // TODO: change this if it works
+    pub decrypted: Vec<u8>,
+    pub iv: [u8; 16],
+}
+
+
+
 
 #[derive(Deserialize,Clone, Debug)]
 pub enum AesKey {
@@ -112,7 +121,6 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
             "aes_encrypt_cbc",
             lua.create_async_function(|lua, params: Value| async move {
             let params: LuaCfg = from_lua_value(&lua, params)?;
-
             // TODO: Replace panics with errors later
             if params.iv.len() != 16 {
               panic!("IV must be exactly 16 bytes, got {}", params.iv.len());
@@ -132,23 +140,36 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
                      .map_err(|e| LuaError::external(e.to_string()))?;
          
             println!("encryption done");
-            
+
              Ok(result)
              })?,
     )?;
     // todo later 
        crypto.set(
         "aes_decrypt_cbc",
-        lua.create_function(|_, (value, enc_key,  iv_param): (String, String,  [u8; 16])| {
-            // TODO: aes_key should come either from bytes or from file depending of user. Use keysource later
-            // TODO: if len is not 16 bytes just erorr our friendly
-               let aes_key = AesKey::from_bytes(enc_key.as_bytes())
+        lua.create_async_function(|lua, params: Value| async move {
+                      let params: LuaCfgDecrypt = from_lua_value(&lua, params)?;
+                      // TODO: Replace panics with errors later
+        if params.iv.len() != 16 {
+              panic!("IV must be exactly 16 bytes, got {}", params.iv.len());
+        }
+        let aes_k =  match params.key_lua {
+            Some(key) => key
+               .get()
+                .await
+                .map_err(|e| LuaError::external(format!("key.get() failed: {}", e)))?,
+            None => panic!("no key provided"), // TODO: do this as error later
+        };
+            
+        let aes_key = AesKey::from_bytes(&aes_k)
                                .map_err(|e| LuaError::external(e.to_string()))?;
-                 let  p = AesParams { key: aes_key, iv: iv_param};
-                 let result = aes_decrypt_cbc(&value.as_bytes(), p)
+        
+        let  p = AesParams { key: aes_key, iv: params.iv};
+
+        let result = aes_decrypt_cbc(&params.decrypted, p)
                      .map_err(|e| LuaError::external(e.to_string()))?;
-             Ok(result)
-             })?,
+        Ok(result)
+        })?,
     )?;
     Ok(())
 }
