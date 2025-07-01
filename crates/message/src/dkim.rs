@@ -249,6 +249,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
                 return Ok(Signer(inner));
             }
             SIGNER_CACHE_MISS.inc();
+            
 
             let signer_creation_timer = SIGNER_CREATE.start_timer();
 

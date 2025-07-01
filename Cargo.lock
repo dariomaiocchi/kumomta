@@ -4204,6 +4204,7 @@ dependencies = [
  "data-loader",
  "mlua",
  "ring",
+ "serde",
  "serde_json",
 ]
 
