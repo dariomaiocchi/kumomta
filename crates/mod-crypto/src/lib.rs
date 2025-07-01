@@ -22,7 +22,7 @@ pub struct AesParams {
 }
 #[derive(Deserialize,Clone, Debug)]
 pub struct LuaCfg {
-    pub key_lua: Option<KeySource>,
+    pub key_lua: Option<KeySource>, // TODO: change this if it works
     pub value: String,
     pub iv: [u8; 16],
 }
@@ -116,7 +116,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
             // TODO: Replace panics with errors later
             if params.iv.len() != 16 {
               panic!("IV must be exactly 16 bytes, got {}", params.iv.len());
-             }
+           }
             let aes_k =  match params.key_lua {
             Some(key) => key
                .get()
@@ -130,6 +130,9 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
             let  p = AesParams { key: aes_key, iv: params.iv};
             let result = aes_encrypt_cbc(&params.value, p)
                      .map_err(|e| LuaError::external(e.to_string()))?;
+         
+            println!("encryption done");
+            
              Ok(result)
              })?,
     )?;
